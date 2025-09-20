@@ -200,88 +200,84 @@ export default function Home() {
     dc.onmessage = async (e) => {
       try {
         if (typeof e.data === "string") {
-          /** Parse text or file metadata */
-          const received = JSON.parse(e.data);
+          const data = JSON.parse(e.data);
 
-          /** Text message */
-          if (received.message && received.sender) {
-            setMessages((prev) => [
-              ...prev,
-              { sender: received.sender || peerId, message: received.message },
-            ]);
-            return;
-          }
-
-          /** File metadata */
-          if (
-            received.filename &&
-            received.size &&
-            received.totalChunks &&
-            received.fileId
-          ) {
-            const fileId = received.fileId;
-            incomingFilesRef.current[fileId] = {
+          /** Metadata */
+          if (data.fileId) {
+            incomingFilesRef.current[data.fileId] = {
               chunks: [],
-              size: received.size,
+              size: data.size,
               received: 0,
-              metadata: received,
+              metadata: data,
+              lastProgressUpdate: 0, /** for throttling progress */
             };
 
-            /** Add placeholder for progress UI */
             setMessages((prev) => [
               ...prev,
               {
-                sender: received.sender || peerId,
-                filename: received.filename,
-                fileSize: received.size,
+                sender: data.sender,
+                filename: data.filename,
                 fileBlob: null,
                 progress: 0,
-                fileId,
+                fileId: data.fileId,
               },
             ]);
           }
-        } else if (e.data instanceof ArrayBuffer) {
-          /** Binary chunk: must find correct file by fileId */
-          const fileId = Object.keys(incomingFilesRef.current).find(
-            (id) => incomingFilesRef.current[id].received < incomingFilesRef.current[id].size
-          );
-          if (!fileId) return;
 
-          const fileData = incomingFilesRef.current[fileId];
+          /** Text message */
+          if (data.message) {
+            setMessages((prev) => [...prev, data]);
+          }
+
+          return;
+        }
+
+        /** Binary chunk */
+        if (e.data instanceof ArrayBuffer) {
+          /** Use fileId map directly */
+          const fileEntry = Object.values(incomingFilesRef.current).find(
+            (f) => f.received < f.size
+          );
+          if (!fileEntry) return;
 
           /** Store chunk and update received bytes */
-          fileData.chunks.push(e.data);
-          fileData.received += e.data.byteLength;
+          fileEntry.chunks.push(e.data);
+          fileEntry.received += e.data.byteLength;
 
-          /** Update progress for UI */
-          const progress = Math.min(
-            100,
-            Math.floor((fileData.received / fileData.size) * 100)
-          );
-          setMessages((prev) =>
-            prev.map((msg) =>
-              msg.fileId === fileId && !msg.fileBlob ? { ...msg, progress } : msg
-            )
-          );
-
-          /** If fully received, combine chunks into a Blob */
-          if (fileData.received >= fileData.size) {
-            const combined = new Blob(fileData.chunks);
+          /** Throttle progress updates to every 5% or 100ms */
+          const progress = Math.floor((fileEntry.received / fileEntry.size) * 100);
+          if (
+            progress - (fileEntry.lastProgressUpdate || 0) >= 5 ||
+            progress === 100
+          ) {
+            fileEntry.lastProgressUpdate = progress;
             setMessages((prev) =>
               prev.map((msg) =>
-                msg.fileId === fileId
+                msg.fileId === fileEntry.metadata.fileId && !msg.fileBlob
+                  ? { ...msg, progress }
+                  : msg
+              )
+            );
+          }
+
+          /** If fully received, combine chunks into a Blob */
+          if (fileEntry.received >= fileEntry.size) {
+            const combined = new Blob(fileEntry.chunks);
+            setMessages((prev) =>
+              prev.map((msg) =>
+                msg.fileId === fileEntry.metadata.fileId
                   ? { ...msg, fileBlob: combined, progress: 100 }
                   : msg
               )
             );
 
             /** Clean up */
-            delete incomingFilesRef.current[fileId];
+            delete incomingFilesRef.current[fileEntry.metadata.fileId];
           }
         }
       } catch (err) {
         /** Handle errors safely */
-        console.error("Error handling received message:", e.data, err);
+        console.error("Error receiving chunk:", err);
       }
     };
   };
@@ -326,9 +322,11 @@ export default function Home() {
 
   /** File drop handler with independent progress per file */
   const handleDrop = useCallback(async (e) => {
+    /** Prevent default drop behavior */
     e.preventDefault();
     setDragOver(false);
 
+    /** Convert FileList to array */
     const files = Array.from(e.dataTransfer.files);
     const BASE_CHUNK_SIZE = 256 * 1024; /** 256 KB per chunk */
     const MAX_BUFFER = 8 * 1024 * 1024; /** 8 MB max buffer */
@@ -337,8 +335,21 @@ export default function Home() {
       const totalChunks = Math.ceil(file.size / BASE_CHUNK_SIZE);
       const fileId = uuidv4();
 
-      for (const { dc } of Object.values(peersRef.current)) {
-        if (!dc || dc.readyState !== "open") continue;
+      /** Add local placeholder for UI immediately */
+      setMessages(prev => [
+        ...prev,
+        {
+          sender: myName,
+          filename: file.name,
+          fileBlob: file,
+          fileId,
+          progress: 0
+        }
+      ]);
+
+      /** Send file to all peers */
+      await Promise.all(Object.values(peersRef.current).map(async ({ dc }) => {
+        if (!dc || dc.readyState !== "open") return;
 
         /** Send metadata first */
         dc.send(JSON.stringify({
@@ -347,67 +358,43 @@ export default function Home() {
           size: file.size,
           totalChunks,
           fileId,
-          type: file.type || "application/octet-stream"
+          type: file.type || "application/octet-stream",
         }));
 
+        dc.bufferedAmountLowThreshold = MAX_BUFFER / 2;
+
         let offset = 0;
-        let inFlight = 0;
-        let dynamicWindow = 5; /** Initial concurrent chunks */
 
-        /** Function to read a slice and send it */
-        const sendChunk = async () => {
-          if (offset >= file.size) return;
-
-          /** Wait if DataChannel buffer is full */
-          while (dc.bufferedAmount > MAX_BUFFER) {
-            await new Promise(res => setTimeout(res, 20));
+        /** Send chunks iteratively */
+        while (offset < file.size) {
+          /** Wait if buffer is full */
+          if (dc.bufferedAmount > MAX_BUFFER) {
+            await new Promise(res => {
+              dc.onbufferedamountlow = () => {
+                dc.onbufferedamountlow = null;
+                res(null);
+              };
+            });
           }
 
+          /** Read slice and send */
           const slice = file.slice(offset, offset + BASE_CHUNK_SIZE);
+          const buffer = await slice.arrayBuffer();
+          dc.send(buffer);
           offset += BASE_CHUNK_SIZE;
-          inFlight++;
 
-          const chunk = await slice.arrayBuffer(); /** Only read this slice into memory */
-          dc.send(chunk);
-          inFlight--;
-
-          /** Adjust window dynamically based on buffer usage */
-          if (dc.bufferedAmount < MAX_BUFFER / 4 && dynamicWindow < 20) {
-            dynamicWindow++;
-          } else if (dc.bufferedAmount > MAX_BUFFER / 2 && dynamicWindow > 1) {
-            dynamicWindow--;
-          }
-
-          /** Continue sending next chunk */
-          if (offset < file.size) sendChunk();
-        };
-
-        /** Start initial window of concurrent chunks */
-        const starters = [];
-        for (let i = 0; i < dynamicWindow && offset < file.size; i++) {
-          starters.push(sendChunk());
+          /** Update progress */
+          const progress = Math.floor((offset / file.size) * 100);
+          setMessages(prev =>
+            prev.map(msg =>
+              msg.fileId === fileId ? { ...msg, progress } : msg
+            )
+          );
         }
-        await Promise.all(starters);
-
-        /** Wait until all chunks finish sending */
-        while (inFlight > 0 || offset < file.size) {
-          await new Promise(res => setTimeout(res, 20));
-        }
-      }
-
-      /** Add local placeholder for UI */
-      setMessages(prev => [
-        ...prev,
-        {
-          sender: myName,
-          filename: file.name,
-          fileBlob: file, /** Use original File object, no need to store full ArrayBuffer */
-          fileId,
-          progress: 100
-        }
-      ]);
+      }));
     }
   }, [myName]);
+
 
   const handleDragOver = (e) => {
     e.preventDefault();
